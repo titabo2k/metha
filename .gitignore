@@ -3,4 +3,6 @@ metha*.deb
 metha*.rpm
 /packaging/deb/metha/usr/*
 /TODO.md
+_resources/*
+_docker/*
 
