@@ -14,7 +14,7 @@ software-properties-common 2>&1
 
 # add some more
 RUN apt-get -y install \
-mc vim less lynx curl wget git make fakeroot
+wget make fakeroot
 
 # Clean up
 RUN apt-get autoremove -y \
@@ -27,8 +27,7 @@ WORKDIR /mnt
 
 RUN wget --no-check-certificate https://dl.google.com/go/go1.13.linux-amd64.tar.gz -P /mnt && \
 tar -xzf /mnt/go1.13.linux-amd64.tar.gz -C /usr/local && \
-echo "export PATH=$PATH:/usr/local/go/bin" >> /etc/profile && \
-. /etc/profile
+rm -f /mnt/go1.13.linux-amd64.tar.gz
 
 ARG username=bill
 
@@ -41,3 +40,17 @@ RUN chown -R $username:$username /mnt
 ENV LANG C.UTF-8
 
 ENV LC_ALL C.UTF-8
+
+ENV MAKE_IT clean
+
+WORKDIR /mnt/metha
+
+CMD ["bash", "-c", "export PATH=$PATH:/usr/local/go/bin && make ${MAKE_IT}"]
+
+### make clean by:
+# docker run --rm --user 1000:1000 --env MAKE_IT=clean -v $(pwd)/:/mnt build_metha:0.1
+#
+### make deb by:
+# docker run --rm --net=host --user 1000:1000 --env MAKE_IT=deb -v $(pwd)/:/mnt build_metha:0.1
+#
+### make ...
