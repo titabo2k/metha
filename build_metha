@@ -53,4 +53,7 @@ CMD ["bash", "-c", "export PATH=$PATH:/usr/local/go/bin && make ${MAKE_IT}"]
 ### make deb by:
 # docker run --rm --net=host --user 1000:1000 --env MAKE_IT=deb -v $(pwd)/:/mnt build_metha:0.1
 #
+### make test by:
+# docker run --rm --net=host --user 1000:1000 --env MAKE_IT=test -v $(pwd)/:/mnt build_metha:0.1
+#
 ### make ...
