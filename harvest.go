@@ -401,18 +401,25 @@ func (h *Harvest) runInterval(iv Interval) error {
 		} else {
 			return err
 		}
+
 		// Issue first observed at
 		// https://gssrjournal.com/gssroai/?resumptionToken=33NjdYRs708&verb=ListRecords,
 		// would spill the disk.
-		prev := token
+
+		// NOTE: auskommentiert als fix für die nicht standardkonforme oai-schnittstelle der fotothek
+		// prev := token
+
 		if token = resp.GetResumptionToken(); token == "" {
 			break
 		}
-		if prev == token {
-			url, _ := req.URL()
-			log.Printf("token %q did not change, assume server issue, moving to next window for: %s", token, url)
-			break
-		}
+
+		// NOTE: auskommentiert als fix für die nicht standardkonforme oai-schnittstelle der fotothek
+		// if prev == token {
+		// 	url, _ := req.URL()
+		// 	log.Printf("token %q did not change, assume server issue, moving to next window for: %s", token, url)
+		// 	break
+		// }
+
 		i++
 		if len(resp.ListRecords.Records) > 0 {
 			empty = 0
