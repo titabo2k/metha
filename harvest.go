@@ -140,11 +140,33 @@ func (h *Harvest) dateLayout() string {
 
 // Run starts the harvest.
 func (h *Harvest) Run() error {
+	log.WithFields(log.Fields{
+		"baseURL":                    h.Config.BaseURL,
+		"format":                     h.Config.Format,
+		"set":                        h.Config.Set,
+		"from":                       h.Config.From,
+		"until":                      h.Config.Until,
+		"disableSelectiveHarvesting": h.Config.DisableSelectiveHarvesting,
+		"hourlyInterval":             h.Config.HourlyInterval,
+		"dailyInterval":              h.Config.DailyInterval,
+		"dir":                        h.Dir(),
+	}).Info("Starting harvest")
+
 	if err := h.mkdirAll(); err != nil {
+		log.WithFields(log.Fields{
+			"dir":   h.Dir(),
+			"error": err.Error(),
+		}).Error("Failed to create directory")
 		return err
 	}
+
 	h.setupInterruptHandler()
 	h.Started = time.Now()
+
+	log.WithFields(log.Fields{
+		"started": h.Started,
+	}).Debug("Harvest initialized")
+
 	return h.run()
 }
 
@@ -160,34 +182,75 @@ func (h *Harvest) temporaryFilesSuffix(suffix string) []string {
 
 // cleanupTemporaryFiles will remove all temporary files in the harvesting dir.
 func (h *Harvest) cleanupTemporaryFiles() error {
+	tempFiles := h.temporaryFiles()
+
 	if h.Config.KeepTemporaryFiles {
-		log.Printf("keeping %d temporary file(s) under %s",
-			len(h.temporaryFiles()), h.Dir())
+		log.WithFields(log.Fields{
+			"count": len(tempFiles),
+			"dir":   h.Dir(),
+		}).Info("Keeping temporary files")
 		return nil
 	}
-	for _, filename := range h.temporaryFiles() {
+
+	log.WithFields(log.Fields{
+		"count": len(tempFiles),
+		"dir":   h.Dir(),
+	}).Debug("Cleaning up temporary files")
+
+	for _, filename := range tempFiles {
 		if err := os.Remove(filename); err != nil {
 			if e, ok := err.(*os.PathError); ok && e.Err == syscall.ENOENT {
+				log.WithFields(log.Fields{
+					"filename": filename,
+				}).Debug("File already removed")
 				continue
 			}
+			log.WithFields(log.Fields{
+				"filename": filename,
+				"error":    err.Error(),
+			}).Error("Failed to remove temporary file")
 			return err
 		}
+		log.WithFields(log.Fields{
+			"filename": filename,
+		}).Debug("Removed temporary file")
 	}
+
+	log.WithFields(log.Fields{
+		"count": len(tempFiles),
+	}).Debug("Temporary files cleanup completed")
+
 	return nil
 }
 
 // setupInterruptHandler will cleanup, so we can CTRL-C or kill savely.
 func (h *Harvest) setupInterruptHandler() {
+	log.Debug("Setting up interrupt handler")
+
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt)
+
 	go func() {
 		<-sigc
-		log.Println("waiting for any rename to finish...")
+		log.WithFields(log.Fields{
+			"dir": h.Dir(),
+		}).Info("Interrupt received, waiting for any rename to finish...")
+
 		h.Lock()
 		defer h.Unlock()
+
+		cleanupStart := time.Now()
 		if err := h.cleanupTemporaryFiles(); err != nil {
-			log.Fatal(err)
+			log.WithFields(log.Fields{
+				"error":       err.Error(),
+				"duration_ms": time.Since(cleanupStart).Milliseconds(),
+			}).Fatal("Failed to clean up temporary files during shutdown")
 		}
+
+		log.WithFields(log.Fields{
+			"duration_ms": time.Since(cleanupStart).Milliseconds(),
+		}).Info("Cleanup completed, exiting")
+
 		os.Exit(0)
 	}()
 }
@@ -199,31 +262,81 @@ func (h *Harvest) finalize(suffix string) error {
 	h.Lock()
 	defer h.Unlock()
 
-	for _, src := range h.temporaryFilesSuffix(suffix) {
+	tempFiles := h.temporaryFilesSuffix(suffix)
+
+	log.WithFields(log.Fields{
+		"count":  len(tempFiles),
+		"suffix": suffix,
+	}).Debug("Finalizing temporary files")
+
+	for _, src := range tempFiles {
 		dst := fmt.Sprintf("%s.gz", strings.Replace(src, suffix, "", -1))
+
+		log.WithFields(log.Fields{
+			"src": src,
+			"dst": dst,
+		}).Debug("Moving and compressing file")
+
 		var err error
+		startTime := time.Now()
 		if err = MoveCompressFile(src, dst); err == nil {
+			log.WithFields(log.Fields{
+				"src":         src,
+				"dst":         dst,
+				"duration_ms": time.Since(startTime).Milliseconds(),
+			}).Debug("File moved and compressed successfully")
 			renamed = append(renamed, dst)
 			continue
 		}
+
+		// Log the error
+		log.WithFields(log.Fields{
+			"src":   src,
+			"dst":   dst,
+			"error": err.Error(),
+		}).Error("Failed to move and compress file")
+
 		// Try to cleanup all the already renamed files.
+		log.WithFields(log.Fields{
+			"count": len(renamed),
+		}).Warn("Attempting to clean up already renamed files due to error")
+
 		for _, fn := range renamed {
 			if e := os.Remove(fn); err != nil {
 				if ee, ok := err.(*os.PathError); ok && ee.Err == syscall.ENOENT {
+					log.WithFields(log.Fields{
+						"filename": fn,
+					}).Debug("File already removed")
 					continue
 				}
+
+				log.WithFields(log.Fields{
+					"filename": fn,
+					"error":    e.Error(),
+				}).Error("Failed to remove file during cleanup")
+
 				return &MultiError{[]error{
 					err,
 					e,
 					fmt.Errorf("inconsistent cache state; start over and purge %s", h.Dir())},
 				}
 			}
+
+			log.WithFields(log.Fields{
+				"filename": fn,
+			}).Debug("Removed file during cleanup")
 		}
 		return err
 	}
+
 	if len(renamed) > 0 {
-		log.Printf("moved %d file(s) into place", len(renamed))
+		log.WithFields(log.Fields{
+			"count": len(renamed),
+		}).Info("Moved files into place")
+	} else {
+		log.Debug("No files to finalize")
 	}
+
 	return nil
 }
 
@@ -276,11 +389,20 @@ func (h *Harvest) defaultInterval() (Interval, error) {
 	if h.Config.Until != "" {
 		end, err = time.Parse("2006-01-02", h.Config.Until)
 		if err != nil {
+			log.WithFields(log.Fields{
+				"until": h.Config.Until,
+				"error": err.Error(),
+			}).Error("Failed to parse custom end date")
 			return Interval{}, err
 		}
-		log.Printf("using custom end date: %v", end)
+		log.WithFields(log.Fields{
+			"end_date": end,
+		}).Info("Using custom end date")
 	} else {
 		end = now.New(h.Started.AddDate(0, 0, -1)).EndOfDay()
+		log.WithFields(log.Fields{
+			"end_date": end,
+		}).Debug("Using default end date (yesterday)")
 	}
 
 	if last == end.Format("2006-01-02") {
@@ -293,25 +415,69 @@ func (h *Harvest) defaultInterval() (Interval, error) {
 func (h *Harvest) retry(operation func() (*Response, error)) (*Response, error) {
 	var lastErr error
 	delay := h.Config.RetryDelay
+
+	log.WithFields(log.Fields{
+		"max_retries":   h.Config.MaxRetries,
+		"initial_delay": delay,
+		"backoff":       h.Config.RetryBackoff,
+	}).Debug("Starting operation with retry mechanism")
+
 	for attempt := 0; attempt <= h.Config.MaxRetries; attempt++ {
 		if attempt > 0 {
-			log.Printf("retry attempt %d/%d after %v", attempt, h.Config.MaxRetries, delay)
+			log.WithFields(log.Fields{
+				"attempt":     attempt,
+				"max_retries": h.Config.MaxRetries,
+				"delay":       delay,
+			}).Info("Retry attempt")
+
 			time.Sleep(delay)
 			// Apply backoff for next attempt
 			delay = time.Duration(float64(delay) * h.Config.RetryBackoff)
 		}
+
+		startTime := time.Now()
 		resp, err := operation()
+		duration := time.Since(startTime)
+
 		if err == nil {
+			log.WithFields(log.Fields{
+				"attempt":     attempt,
+				"duration_ms": duration.Milliseconds(),
+			}).Debug("Operation succeeded")
 			return resp, nil
 		}
+
 		// Save the error for potential return
 		lastErr = err
+
+		// Log detailed error information
+		logFields := log.Fields{
+			"attempt":     attempt + 1,
+			"max_retries": h.Config.MaxRetries,
+			"error":       err.Error(),
+			"duration_ms": duration.Milliseconds(),
+		}
+
+		// Add HTTP status code if available
+		if httpErr, ok := err.(HTTPError); ok {
+			logFields["status_code"] = httpErr.StatusCode
+			logFields["url"] = httpErr.URL.String()
+		}
+
 		// Check if we should retry based on the error
 		if !h.shouldRetry(err) {
+			log.WithFields(logFields).Error("Request failed, not retrying")
 			return nil, err
 		}
-		log.Printf("request failed (attempt %d/%d): %v", attempt+1, h.Config.MaxRetries, err)
+
+		log.WithFields(logFields).Warn("Request failed, will retry")
 	}
+
+	log.WithFields(log.Fields{
+		"max_retries": h.Config.MaxRetries,
+		"error":       lastErr.Error(),
+	}).Error("Operation failed after maximum retries")
+
 	return nil, fmt.Errorf("failed after %d retries: %w", h.Config.MaxRetries, lastErr)
 }
 
@@ -345,57 +511,137 @@ func (h *Harvest) shouldRetry(err error) bool {
 
 // run runs a harvest: one request plus subsequent tokens.
 func (h *Harvest) run() (err error) {
+	log.WithFields(log.Fields{
+		"baseURL": h.Config.BaseURL,
+		"format":  h.Config.Format,
+		"set":     h.Config.Set,
+	}).Info("Starting harvest run")
+
 	defer func() {
+		cleanupStart := time.Now()
 		if e := h.cleanupTemporaryFiles(); e != nil {
+			log.WithFields(log.Fields{
+				"error":       e.Error(),
+				"duration_ms": time.Since(cleanupStart).Milliseconds(),
+			}).Error("Failed to cleanup temporary files")
+
 			if err != nil {
 				err = &MultiError{[]error{err, e}}
 			}
 			err = e
+		} else {
+			log.WithFields(log.Fields{
+				"duration_ms": time.Since(cleanupStart).Milliseconds(),
+			}).Debug("Temporary files cleanup completed")
 		}
 	}()
 
 	if h.Config.DisableSelectiveHarvesting {
+		log.Info("Selective harvesting disabled, running without intervals")
 		return h.runInterval(Interval{})
 	}
 
+	intervalStart := time.Now()
 	interval, err := h.defaultInterval()
 	if err != nil {
+		log.WithFields(log.Fields{
+			"error":       err.Error(),
+			"duration_ms": time.Since(intervalStart).Milliseconds(),
+		}).Error("Failed to get default interval")
 		return fmt.Errorf("failed to get default interval: %w", err)
 	}
+
+	log.WithFields(log.Fields{
+		"begin":       interval.Begin,
+		"end":         interval.End,
+		"duration_ms": time.Since(intervalStart).Milliseconds(),
+	}).Info("Default interval determined")
 
 	var intervals []Interval
 
 	switch {
 	case h.Config.HourlyInterval:
 		intervals = interval.HourlyIntervals()
+		log.WithFields(log.Fields{
+			"count": len(intervals),
+		}).Info("Using hourly intervals")
 	case h.Config.DailyInterval:
 		intervals = interval.DailyIntervals()
+		log.WithFields(log.Fields{
+			"count": len(intervals),
+		}).Info("Using daily intervals")
 	default:
 		intervals = interval.MonthlyIntervals()
+		log.WithFields(log.Fields{
+			"count": len(intervals),
+		}).Info("Using monthly intervals")
 	}
 
-	for _, iv := range intervals {
+	for i, iv := range intervals {
+		log.WithFields(log.Fields{
+			"interval_index":  i,
+			"total_intervals": len(intervals),
+			"begin":           iv.Begin,
+			"end":             iv.End,
+		}).Info("Processing interval")
+
 		if err := h.runInterval(iv); err != nil {
 			if h.Config.IgnoreUnexpectedEOF && err == io.ErrUnexpectedEOF {
-				log.Printf("ignoring unexpected EOF and moving to next interval")
+				log.WithFields(log.Fields{
+					"interval_index": i,
+					"begin":          iv.Begin,
+					"end":            iv.End,
+				}).Warn("Ignoring unexpected EOF and moving to next interval")
 				continue
 			}
+
+			log.WithFields(log.Fields{
+				"interval_index": i,
+				"begin":          iv.Begin,
+				"end":            iv.End,
+				"error":          err.Error(),
+			}).Error("Failed to process interval")
+
 			return err
 		}
+
+		log.WithFields(log.Fields{
+			"interval_index": i,
+			"begin":          iv.Begin,
+			"end":            iv.End,
+		}).Info("Interval processed successfully")
 	}
+
+	log.WithFields(log.Fields{
+		"interval_count": len(intervals),
+	}).Info("Harvest run completed successfully")
+
 	return nil
 }
 
 // runInterval runs a selective harvest on the given interval.
 func (h *Harvest) runInterval(iv Interval) error {
 	suffix := fmt.Sprintf("-tmp-%d", rand.Intn(999999999))
+
+	log.WithFields(log.Fields{
+		"begin":  iv.Begin,
+		"end":    iv.End,
+		"suffix": suffix,
+	}).Info("Starting interval harvest")
+
 	var token string
 	var i, empty int
+	startTime := time.Now()
+
 	for {
 		if h.Config.MaxRequests == i {
-			log.Printf("max requests limit (%d) reached", h.Config.MaxRequests)
+			log.WithFields(log.Fields{
+				"max_requests":  h.Config.MaxRequests,
+				"requests_made": i,
+			}).Warn("Max requests limit reached")
 			break
 		}
+
 		req := Request{
 			BaseURL:                 h.Config.BaseURL,
 			MetadataPrefix:          h.Config.Format,
@@ -406,6 +652,7 @@ func (h *Harvest) runInterval(iv Interval) error {
 			SuppressFormatParameter: h.Config.SuppressFormatParameter,
 			ExtraHeaders:            h.Config.ExtraHeaders,
 		}
+
 		var filedate string
 		if h.Config.DisableSelectiveHarvesting {
 			// Used, when endpoint cannot handle from and until.
@@ -416,135 +663,326 @@ func (h *Harvest) runInterval(iv Interval) error {
 			req.Until = iv.End.Format(h.dateLayout())
 		}
 
+		requestFields := log.Fields{
+			"request_num":  i + 1,
+			"filedate":     filedate,
+			"token":        token,
+			"from":         req.From,
+			"until":        req.Until,
+			"elapsed_time": time.Since(startTime),
+		}
+		log.WithFields(requestFields).Info("Preparing request")
+
 		if h.Config.Delay > 0 {
+			log.WithFields(log.Fields{
+				"delay_ms": h.Config.Delay.Milliseconds(),
+			}).Debug("Applying delay before request")
 			time.Sleep(h.Config.Delay)
 		}
 
 		// Use retry mechanism for the request
+		requestStart := time.Now()
 		resp, err := h.retry(func() (*Response, error) {
 			return h.Client.Do(&req)
 		})
+		requestDuration := time.Since(requestStart)
+
+		requestFields["duration_ms"] = requestDuration.Milliseconds()
 
 		if err != nil {
+			requestFields["error"] = err.Error()
+
 			// If we've exhausted all retries and still have an error
 			if !h.Config.IgnoreHTTPErrors {
+				log.WithFields(requestFields).Error("Failed to make request after retries")
 				return fmt.Errorf("failed to make request after retries: %w", err)
 			}
+
 			// If we're ignoring HTTP errors, continue to next iteration
+			log.WithFields(requestFields).Warn("Ignoring HTTP error and continuing")
 			i++
 			continue
 		}
 
-		// Handle OAI specific errors. XXX: An badResumptionToken kind of error
-		// might be recoverable, by simply restarting the harvest.
+		// Handle OAI specific errors
 		if resp.Error.Code != "" {
+			requestFields["oai_error_code"] = resp.Error.Code
+			requestFields["oai_error_message"] = resp.Error.Message
+
 			// Rare case, where a resumptionToken is given, but it leads to
 			// noRecordsMatch - we still want to save, whatever we got up until
 			// this point, so we break here.
 			switch resp.Error.Code {
 			case "noRecordsMatch":
 				if !resp.HasResumptionToken() {
+					log.WithFields(requestFields).Info("No records match, ending harvest")
 					break
 				}
-				log.Println("resumptionToken set and noRecordsMatch, continuing")
+				log.WithFields(requestFields).Warn("ResumptionToken set and noRecordsMatch, continuing")
 			case "badResumptionToken":
-				log.Println("badResumptionToken, might signal end-of-harvest")
+				log.WithFields(requestFields).Warn("BadResumptionToken, might signal end-of-harvest")
 			case "InternalException":
 				// #9717, InternalException Could not send Message.
-				log.Println("InternalException: retrying request in a few instants...")
+				log.WithFields(requestFields).Warn("InternalException: retrying request in a few instants...")
 				time.Sleep(30 * time.Second)
 				i++ // Count towards the total request limit.
 				continue
 			default:
+				log.WithFields(requestFields).Error("Unhandled OAI error")
 				return resp.Error
 			}
 		}
+
 		// The filename consists of the right boundary (until), the
 		// serial number of the request and a suffix, marking this
 		// request in progress.
 		filename := filepath.Join(h.Dir(), fmt.Sprintf("%s-%08d.xml%s", filedate, i, suffix))
+		requestFields["filename"] = filename
+
 		if b, err := xml.Marshal(resp); err == nil {
+			writeStart := time.Now()
 			if e := ioutil.WriteFile(filename, b, 0644); e != nil {
+				log.WithFields(log.Fields{
+					"filename": filename,
+					"error":    e.Error(),
+				}).Error("Failed to write response to file")
 				return e
 			}
-			log.Printf("wrote %s", filename)
+
+			log.WithFields(log.Fields{
+				"filename":    filename,
+				"size_bytes":  len(b),
+				"duration_ms": time.Since(writeStart).Milliseconds(),
+			}).Info("Wrote response to file")
 		} else {
+			log.WithFields(log.Fields{
+				"error": err.Error(),
+			}).Error("Failed to marshal response to XML")
 			return err
 		}
+
+		// Check for resumption token
+		prev := token
+		if token = resp.GetResumptionToken(); token == "" {
+			log.WithFields(requestFields).Info("No resumption token, harvest complete")
+			break
+		}
+
+		requestFields["new_token"] = token
+
 		// Issue first observed at
 		// https://gssrjournal.com/gssroai/?resumptionToken=33NjdYRs708&verb=ListRecords,
 		// would spill the disk.
-		prev := token
-		if token = resp.GetResumptionToken(); token == "" {
-			break
-		}
 		if prev == token {
 			url, _ := req.URL()
-			log.Printf("token %q did not change, assume server issue, moving to next window for: %s", token, url)
+			log.WithFields(log.Fields{
+				"token": token,
+				"url":   url.String(),
+			}).Warn("Token did not change, assume server issue, moving to next window")
 			break
 		}
-		i++
+
+		// Track record count and empty responses
 		if len(resp.ListRecords.Records) > 0 {
+			requestFields["record_count"] = len(resp.ListRecords.Records)
+			log.WithFields(requestFields).Info("Response contains records")
 			empty = 0
 		} else {
 			empty++
-			log.Printf("warning: successive empty response: %d/%d", empty, h.Config.MaxEmptyResponses)
+			log.WithFields(log.Fields{
+				"empty_count":       empty,
+				"max_empty_allowed": h.Config.MaxEmptyResponses,
+			}).Warn("Successive empty response")
 		}
+
 		if empty == h.Config.MaxEmptyResponses {
-			log.Printf("max number of empty responses reached")
+			log.WithFields(log.Fields{
+				"max_empty_responses": h.Config.MaxEmptyResponses,
+			}).Warn("Max number of empty responses reached")
 			break
 		}
+
+		i++
 	}
-	return h.finalize(suffix)
+
+	finalizeStart := time.Now()
+	err := h.finalize(suffix)
+
+	if err != nil {
+		log.WithFields(log.Fields{
+			"error":       err.Error(),
+			"suffix":      suffix,
+			"duration_ms": time.Since(finalizeStart).Milliseconds(),
+		}).Error("Failed to finalize harvest")
+		return err
+	}
+
+	log.WithFields(log.Fields{
+		"requests":    i,
+		"duration":    time.Since(startTime),
+		"begin":       iv.Begin,
+		"end":         iv.End,
+		"duration_ms": time.Since(finalizeStart).Milliseconds(),
+	}).Info("Interval harvest completed")
+
+	return nil
 }
 
 // earliestDate returns the earliest date as a time.Time value.
 func (h *Harvest) earliestDate() (time.Time, error) {
 	// Different granularities are possible: https://eudml.org/oai/OAIHandler?verb=Identify
 	// First occurence of a non-standard granularity: https://t3.digizeitschriften.de/oai2/
+
+	log.WithFields(log.Fields{
+		"granularity":        h.Identify.Granularity,
+		"earliest_datestamp": h.Identify.EarliestDatestamp,
+	}).Debug("Determining earliest date")
+
 	switch strings.ToLower(h.Identify.Granularity) {
 	case "yyyy-mm-dd":
 		if len(h.Identify.EarliestDatestamp) <= 10 {
-			return time.Parse("2006-01-02", h.Identify.EarliestDatestamp)
+			date, err := time.Parse("2006-01-02", h.Identify.EarliestDatestamp)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"datestamp": h.Identify.EarliestDatestamp,
+					"error":     err.Error(),
+				}).Error("Failed to parse earliest date with YYYY-MM-DD format")
+				return time.Time{}, err
+			}
+			log.WithFields(log.Fields{
+				"date": date,
+			}).Debug("Parsed earliest date with YYYY-MM-DD format")
+			return date, nil
 		}
-		return time.Parse("2006-01-02", h.Identify.EarliestDatestamp[:10])
+
+		date, err := time.Parse("2006-01-02", h.Identify.EarliestDatestamp[:10])
+		if err != nil {
+			log.WithFields(log.Fields{
+				"datestamp": h.Identify.EarliestDatestamp[:10],
+				"error":     err.Error(),
+			}).Error("Failed to parse earliest date with truncated YYYY-MM-DD format")
+			return time.Time{}, err
+		}
+		log.WithFields(log.Fields{
+			"date":            date,
+			"original_length": len(h.Identify.EarliestDatestamp),
+			"truncated_to":    10,
+		}).Debug("Parsed earliest date with truncated YYYY-MM-DD format")
+		return date, nil
+
 	case "yyyy-mm-ddthh:mm:ssz":
 		// refs. #8825
 		if len(h.Identify.EarliestDatestamp) >= 10 && len(h.Identify.EarliestDatestamp) < 20 {
-			return time.Parse("2006-01-02", h.Identify.EarliestDatestamp[:10])
+			date, err := time.Parse("2006-01-02", h.Identify.EarliestDatestamp[:10])
+			if err != nil {
+				log.WithFields(log.Fields{
+					"datestamp": h.Identify.EarliestDatestamp[:10],
+					"error":     err.Error(),
+				}).Error("Failed to parse earliest date with truncated YYYY-MM-DDThh:mm:ssZ format")
+				return time.Time{}, err
+			}
+			log.WithFields(log.Fields{
+				"date":            date,
+				"original_length": len(h.Identify.EarliestDatestamp),
+				"truncated_to":    10,
+			}).Debug("Parsed earliest date with truncated YYYY-MM-DDThh:mm:ssZ format")
+			return date, nil
 		}
-		return time.Parse("2006-01-02T15:04:05Z", h.Identify.EarliestDatestamp)
+
+		date, err := time.Parse("2006-01-02T15:04:05Z", h.Identify.EarliestDatestamp)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"datestamp": h.Identify.EarliestDatestamp,
+				"error":     err.Error(),
+			}).Error("Failed to parse earliest date with YYYY-MM-DDThh:mm:ssZ format")
+			return time.Time{}, err
+		}
+		log.WithFields(log.Fields{
+			"date": date,
+		}).Debug("Parsed earliest date with YYYY-MM-DDThh:mm:ssZ format")
+		return date, nil
+
 	default:
+		log.WithFields(log.Fields{
+			"granularity": h.Identify.Granularity,
+		}).Error("Invalid granularity format")
 		return time.Time{}, ErrInvalidEarliestDate
 	}
 }
 
 // identify runs an OAI identify request and caches the result.
 func (h *Harvest) identify() error {
+	log.WithFields(log.Fields{
+		"baseURL": h.Config.BaseURL,
+	}).Info("Identifying repository")
+
 	req := Request{
 		Verb:         "Identify",
 		BaseURL:      h.Config.BaseURL,
 		ExtraHeaders: h.Config.ExtraHeaders,
 	}
+
 	if h.Client == nil {
 		h.Client = DefaultClient
+		log.Debug("Using default client for identify request")
 	}
+
+	startTime := time.Now()
 	resp, err := h.Client.Do(&req)
+	duration := time.Since(startTime)
+
 	if err != nil {
-		log.Printf("trying workaround: %v", err)
+		log.WithFields(log.Fields{
+			"error":       err.Error(),
+			"baseURL":     h.Config.BaseURL,
+			"duration_ms": duration.Milliseconds(),
+		}).Warn("Identify request failed, trying workaround")
+
 		// try to workaround for the whole harvest
 		if h.Config.ExtraHeaders == nil {
 			h.Config.ExtraHeaders = make(http.Header)
 		}
 		h.Config.ExtraHeaders.Set("Accept-Encoding", "identity")
+
 		// also apply to this request
 		req.ExtraHeaders = h.Config.ExtraHeaders
+
+		log.WithFields(log.Fields{
+			"headers": req.ExtraHeaders,
+		}).Debug("Retrying identify with modified headers")
+
+		retryStart := time.Now()
 		resp, err = h.Client.Do(&req)
+		retryDuration := time.Since(retryStart)
+
 		if err != nil {
+			log.WithFields(log.Fields{
+				"error":       err.Error(),
+				"baseURL":     h.Config.BaseURL,
+				"duration_ms": retryDuration.Milliseconds(),
+			}).Error("Identify request failed after workaround")
 			return err
 		}
+
+		log.WithFields(log.Fields{
+			"duration_ms": retryDuration.Milliseconds(),
+		}).Info("Identify request succeeded with workaround")
+	} else {
+		log.WithFields(log.Fields{
+			"duration_ms": duration.Milliseconds(),
+		}).Info("Identify request succeeded")
 	}
+
 	h.Identify = &resp.Identify
+
+	log.WithFields(log.Fields{
+		"repository_name":    resp.Identify.RepositoryName,
+		"earliest_datestamp": resp.Identify.EarliestDatestamp,
+		"granularity":        resp.Identify.Granularity,
+		"protocol_version":   resp.Identify.ProtocolVersion,
+		"deleted_record":     resp.Identify.DeletedRecord,
+	}).Info("Repository identified")
+
 	return nil
 }
 
@@ -553,4 +991,7 @@ func init() {
 	if dir := os.Getenv("METHA_DIR"); dir != "" {
 		BaseDir = dir
 	}
+
+	// Setup logging with function and file information
+	SetupLogging()
 }

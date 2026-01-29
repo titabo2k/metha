@@ -124,6 +124,18 @@ func (c *Client) Do(r *Request) (*Response, error) {
 	}
 	log.Println(link)
 
+	// Log the request details
+	log.WithFields(log.Fields{
+		"verb":            r.Verb,
+		"baseURL":         r.BaseURL,
+		"metadataPrefix":  r.MetadataPrefix,
+		"set":             r.Set,
+		"from":            r.From,
+		"until":           r.Until,
+		"resumptionToken": r.ResumptionToken,
+		"url":             link.String(),
+	}).Info("OAI-PMH request")
+
 	req, err := http.NewRequest("GET", link.String(), nil)
 	if err != nil {
 		return nil, err
@@ -134,11 +146,44 @@ func (c *Client) Do(r *Request) (*Response, error) {
 			req.Header.Add(name, value)
 		}
 	}
+
+	// Log all request headers
+	headerFields := log.Fields{}
+	for name, values := range req.Header {
+		headerFields[name] = strings.Join(values, ", ")
+	}
+	log.WithFields(headerFields).Debug("Request headers")
+
+	startTime := time.Now()
 	resp, err := c.Doer.Do(req)
+	duration := time.Since(startTime)
+
 	if err != nil {
+		log.WithFields(log.Fields{
+			"error":    err.Error(),
+			"url":      link.String(),
+			"duration": duration,
+		}).Error("HTTP request failed")
 		return nil, err
 	}
+
+	// Log response status and headers
+	respHeaderFields := log.Fields{
+		"status":      resp.Status,
+		"statusCode":  resp.StatusCode,
+		"duration_ms": duration.Milliseconds(),
+		"url":         link.String(),
+	}
+	for name, values := range resp.Header {
+		respHeaderFields["resp_"+name] = strings.Join(values, ", ")
+	}
+	log.WithFields(respHeaderFields).Info("OAI-PMH response received")
+
 	if resp.StatusCode >= 400 {
+		log.WithFields(log.Fields{
+			"statusCode": resp.StatusCode,
+			"url":        link.String(),
+		}).Error("HTTP error response")
 		return nil, HTTPError{URL: link, RequestError: err, StatusCode: resp.StatusCode}
 	}
 	defer resp.Body.Close()
@@ -163,12 +208,29 @@ func (c *Client) Do(r *Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Log response body size
+	log.WithFields(log.Fields{
+		"size_bytes": len(respBody),
+		"url":        link.String(),
+	}).Debug("Response body size")
 	// refs #21812, hack around misleading XML declarations; we only cover
 	// declared "UTF-8", but actually ... A rare issue nonetheless; add more
 	// cases here if necessary; observed in the wild in 05/2022 at
 	// http://digi.ub.uni-heidelberg.de/cgi-bin/digioai.cgi?from=2021-07-01T00:00:00Z&metadataPrefix=oai_dc&until=2021-07-31T23:59:59Z&verb=ListRecords.
 	//
 	// TODO: https://github.com/miku/metha/issues/35
+
+	// Log first 1000 bytes of response for debugging
+	previewSize := 1000
+	if len(respBody) < previewSize {
+		previewSize = len(respBody)
+	}
+	log.WithFields(log.Fields{
+		"preview": string(respBody[:previewSize]),
+		"url":     link.String(),
+	}).Debug("Response body preview")
+
 	decls := [][]byte{
 		[]byte(`<?xml version="1.0" encoding="UTF-8"?>`),
 		[]byte(`<?xml version="1.0" encoding="ISO-8859-1"?>`),
@@ -184,15 +246,81 @@ func (c *Client) Do(r *Request) (*Response, error) {
 		var response Response
 		if err := dec.Decode(&response); err != nil {
 			if !bytes.HasPrefix(body, []byte(`<?xml version="1.0"`)) {
+				log.WithFields(log.Fields{
+					"error": err.Error(),
+					"url":   link.String(),
+				}).Error("XML decode failed completely")
 				return nil, err
 			}
-			log.Printf("decode failed with: %v", string(decl))
+			log.WithFields(log.Fields{
+				"encoding": string(decl),
+				"error":    err.Error(),
+				"url":      link.String(),
+			}).Debug("XML decode failed with encoding")
 			continue
 		}
+
 		if i > 0 {
-			log.Printf("decode worked with adjusted declaration: %v", string(decl))
+			log.WithFields(log.Fields{
+				"encoding": string(decl),
+				"url":      link.String(),
+			}).Info("XML decode succeeded with adjusted encoding")
 		}
+
+		// Log response details
+		responseFields := log.Fields{
+			"url": link.String(),
+		}
+
+		if response.Error.Code != "" {
+			responseFields["oai_error_code"] = response.Error.Code
+			responseFields["oai_error_message"] = response.Error.Message
+			log.WithFields(responseFields).Warn("OAI-PMH error in response")
+		}
+
+		// Log resumption token if present
+		if token := response.GetResumptionToken(); token != "" {
+			responseFields["resumption_token"] = token
+			if size := response.CompleteListSize(); size != "" {
+				responseFields["complete_list_size"] = size
+			}
+			if cursor := response.Cursor(); cursor != "" {
+				responseFields["cursor"] = cursor
+			}
+			log.WithFields(responseFields).Info("Response contains resumption token")
+		}
+
+		// Log record count
+		if len(response.ListRecords.Records) > 0 {
+			responseFields["record_count"] = len(response.ListRecords.Records)
+			log.WithFields(responseFields).Info("Response contains records")
+		} else if len(response.ListIdentifiers.Headers) > 0 {
+			responseFields["identifier_count"] = len(response.ListIdentifiers.Headers)
+			log.WithFields(responseFields).Info("Response contains identifiers")
+		} else if len(response.ListSets.Set) > 0 {
+			responseFields["set_count"] = len(response.ListSets.Set)
+			log.WithFields(responseFields).Info("Response contains sets")
+		} else if len(response.ListMetadataFormats.MetadataFormat) > 0 {
+			responseFields["format_count"] = len(response.ListMetadataFormats.MetadataFormat)
+			log.WithFields(responseFields).Info("Response contains metadata formats")
+		} else if response.Identify.RepositoryName != "" {
+			responseFields["repository_name"] = response.Identify.RepositoryName
+			responseFields["earliest_datestamp"] = response.Identify.EarliestDatestamp
+			responseFields["granularity"] = response.Identify.Granularity
+			log.WithFields(responseFields).Info("Response contains repository information")
+		} else if response.GetRecord.Record.Header.Identifier != "" {
+			responseFields["identifier"] = response.GetRecord.Record.Header.Identifier
+			log.WithFields(responseFields).Info("Response contains a single record")
+		} else {
+			log.WithFields(responseFields).Warn("Response contains no records or identifiers")
+		}
+
 		return &response, nil
 	}
+
+	log.WithFields(log.Fields{
+		"url": link.String(),
+	}).Error("Failed to parse response with any encoding")
+
 	return nil, fmt.Errorf("failed to parse response")
 }
